@@ -1,0 +1,21 @@
+# 编译生成的文件
+/build/
+*.o
+*.obj
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+*.app
+
+# CMake 相关文件
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# 其他常见忽略项
+*.log
+*.tmp
+*.swp
