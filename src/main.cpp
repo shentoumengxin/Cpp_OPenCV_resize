@@ -65,13 +65,13 @@ int main(int argc, char** argv) {
 
             for (const auto& method : methods) {
                 // 自定义Resize
-                cv::Mat output_custom;
+                Mat output_custom;
                 double custom_time = measure_time([&]() {
                     resize_custom(input, output_custom, new_size, method);
                 });
 
                 // OpenCV的Resize
-                cv::Mat output_opencv;
+                Mat output_opencv;
                 double opencv_time = measure_time([&]() {
                     int interp_flag = (method == NEAREST_NEIGHBOR) ? cv::INTER_NEAREST : cv::INTER_LINEAR;
                     cv::resize(input, output_opencv, new_size, 0, 0, interp_flag);
@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
     }
 
     // 保存原始图像和一个调整大小后的图像作为示例
-    cv::Mat resized_example;
+    Mat resized_example;
     resize_custom(input, resized_example, cv::Size(static_cast<int>(input.cols * 1.5), static_cast<int>(input.rows * 1.5)), NEAREST_NEIGHBOR);
 
     // 保存原始图像

@@ -25,7 +25,7 @@ Mat resizeNN_MT(const Mat& input, int output_width, int output_height) {
         double scale_width;
         double scale_height;
 
-        ResizeNN_Parallel(const cv::Mat& in, cv::Mat& out, double sw, double sh)
+        ResizeNN_Parallel(const Mat& in, Mat& out, double sw, double sh)
             : input(in), output(out), scale_width(sw), scale_height(sh) {}
 
         virtual void operator()(const cv::Range& range) const CV_OVERRIDE {
@@ -55,8 +55,8 @@ Mat resizeNN_MT(const Mat& input, int output_width, int output_height) {
 }
 
 // 实现多线程双线性插值
-cv::Mat resizeBilinear_MT(const cv::Mat& input, int output_width, int output_height) {
-    cv::Mat output(output_height, output_width, input.type());
+Mat resizeBilinear_MT(const cv::Mat& input, int output_width, int output_height) {
+    Mat output(output_height, output_width, input.type());
 
     double scale_width = static_cast<double>(output_width) / input.cols;
     double scale_height = static_cast<double>(output_height) / input.rows;
