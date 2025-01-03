@@ -9,7 +9,7 @@
 
 // 仅使用 std 命名空间
 using namespace std;
-
+using cv::Mat;
 // 不使用 cv 命名空间，显式使用 cv:: 前缀
 
 // 实现 PSNR 计算函数
