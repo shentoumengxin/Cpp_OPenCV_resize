@@ -9,7 +9,7 @@
 
 // 仅使用 std 命名空间
 using namespace std;
-
+using cv::Mat;
 // 不使用 cv 命名空间，显式使用 cv:: 前缀
 
 // 实现 PSNR 计算函数
@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
     }
 
     // 定义测试参数
-    vector<cv::Size> test_sizes = {cv::Size(800, 600), cv::Size(400, 300), cv::Size(1600, 1200)};
+    vector<cv::Size> test_sizes = {cv::Size(4000, 1200), cv::Size(400, 300), cv::Size(1600, 1200)};
     vector<double> scale_factors = {0.5, 1.5};
     vector<InterpolationMethod> methods = {NEAREST_NEIGHBOR, BILINEAR};
 
