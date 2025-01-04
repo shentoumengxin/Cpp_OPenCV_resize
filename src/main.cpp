@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
 
     // 定义测试参数
     vector<cv::Size> test_sizes = {cv::Size(4000, 1200), cv::Size(400, 300), cv::Size(1600, 1200)};
-    vector<double> scale_factors = {0.5, 1.5};
+    vector<double> scale_factors = {0.7, 2};
     vector<InterpolationMethod> methods = {NEAREST_NEIGHBOR, BILINEAR};
 
     // 遍历测试参数
