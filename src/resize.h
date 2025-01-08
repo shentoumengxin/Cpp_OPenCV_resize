@@ -12,7 +12,7 @@ enum InterpolationMethod {
 };
 
 // 多线程版本的Resize函数
-void resize_custom(const cv::Mat& input, cv::Mat& output, const cv::Size& new_size, InterpolationMethod method);
+void resize_custom(const cv::Mat& input, cv::Mat& output, const cv::Size& new_size, InterpolationMethod method,bool MT=1);
 
 // 单线程版本的最近邻插值
 cv::Mat resizeNN_ST(const cv::Mat& input, int output_width, int output_height);

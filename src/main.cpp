@@ -13,7 +13,27 @@ using cv::Mat;
 // 不使用 cv 命名空间，显式使用 cv:: 前缀
 
 // 实现 PSNR 计算函数
+
+#include <cmath>
+#include <stdexcept>
+
+// 实现 PSNR 计算函数
 double PSNR(const cv::Mat& I1, const cv::Mat& I2) {
+    // 验证输入图像是否为空
+    if (I1.empty() || I2.empty()) {
+        throw std::invalid_argument("输入图像不能为空");
+    }
+
+    // 验证输入图像的尺寸是否相同
+    if (I1.size() != I2.size()) {
+        throw std::invalid_argument("输入图像的尺寸必须相同");
+    }
+
+    // 验证输入图像的类型是否相同
+    if (I1.type() != I2.type()) {
+        throw std::invalid_argument("输入图像的类型必须相同");
+    }
+
     cv::Mat s1;
     cv::absdiff(I1, I2, s1);       // |I1 - I2|
     s1.convertTo(s1, CV_32F);      // 转换为 float
@@ -21,15 +41,41 @@ double PSNR(const cv::Mat& I1, const cv::Mat& I2) {
 
     cv::Scalar s = cv::sum(s1);    // 计算所有元素的和
 
-    double sse = s.val[0] + s.val[1] + s.val[2];
-    if( sse <= 1e-10) // 如果两张图像完全相同
-        return 0;
+    // 动态计算所有通道的总平方误差
+    double sse = 0.0;
+    int channels = I1.channels();
+    for(int i = 0; i < channels; ++i){
+        sse += s.val[i];
+    }
+
+    if(sse <= 1e-10) { // 如果两张图像完全相同
+        return INFINITY; // 返回无穷大
+    }
     else {
-        double mse = sse / (double)(I1.channels() * I1.total());
-        double psnr = 10.0 * log10((255 * 255) / mse);
+        double mse = sse / (static_cast<double>(channels) * I1.total());
+        
+        // 根据图像类型确定最大像素值
+        double max_I;
+        switch(I1.depth()) {
+            case CV_8U:
+                max_I = 255.0;
+                break;
+            case CV_16U:
+                max_I = 65535.0;
+                break;
+            case CV_32F:
+            case CV_64F:
+                max_I = 1.0; // 假设浮点图像归一化到[0,1]
+                break;
+            default:
+                throw std::invalid_argument("Unsupported image depth for PSNR calculation");
+        }
+
+        double psnr = 10.0 * log10((max_I * max_I) / mse);
         return psnr;
     }
 }
+
 
 // 函数用于测量执行时间（毫秒）
 double measure_time(function<void()> func) {
@@ -54,8 +100,8 @@ int main(int argc, char** argv) {
     }
 
     // 定义测试参数
-    vector<cv::Size> test_sizes = {cv::Size(4000, 1200), cv::Size(400, 300), cv::Size(1600, 1200)};
-    vector<double> scale_factors = {0.7, 2};
+    vector<cv::Size> test_sizes = {cv::Size(1800, 2600), cv::Size(400, 300), cv::Size(1600, 1200)};
+    vector<double> scale_factors = {0.5, 1.5};
     vector<InterpolationMethod> methods = {NEAREST_NEIGHBOR, BILINEAR};
 
     // 遍历测试参数

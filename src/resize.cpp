@@ -7,17 +7,16 @@
 #include <algorithm>
 #include <type_traits>
 #include <stdexcept>
-#include <immintrin.h> // 如果需要AVX向量化
-#include <stdexcept>
+#include <immintrin.h> // For AVX intrinsics
+#include <omp.h>       // For OpenMP
 
-// 使用cv命名空间中的Mat
 using cv::Mat;
 
-// 辅助模板函数：线性插值并确保结果在有效范围内
+// Helper template function: Clamp and round the interpolated value
 template <typename T>
 T clamp_and_round(double value);
 
-// 特化模板函数用于不同的数据类型
+// Template specializations for different data types
 template <>
 uchar clamp_and_round<uchar>(double value) {
     return static_cast<uchar>(std::round(std::min(std::max(value, 0.0), 255.0)));
@@ -30,345 +29,507 @@ ushort clamp_and_round<ushort>(double value) {
 
 template <>
 float clamp_and_round<float>(double value) {
-    // 对于浮点数，通常不需要限制范围，但根据需求可以添加限制
+    // For floating points, clamping can be adjusted based on requirements
     return static_cast<float>(value);
 }
 
-
-// 多线程最近邻插值模板实现，使用AVX
+// Multi-threaded Nearest Neighbor Interpolation with AVX Optimization
 template <typename T>
-Mat resizeNN(const Mat& input, int output_width, int output_height, int channels) {
-    Mat output(output_height, output_width, input.type());
+Mat resizeNN_AVX(const Mat &input, int output_width, int output_height, int channels)
+{
+    // Ensure the input matrix is continuous for optimized memory access
+    Mat input_continuous = input.isContinuous() ? input : input.clone();
+    Mat output(output_height, output_width, input_continuous.type());
 
-    double scale_width = static_cast<double>(output_width) / input.cols;
-    double scale_height = static_cast<double>(output_height) / input.rows;
+    // Calculate inverse scaling factors to avoid division in loops
+    double inv_scale_width = static_cast<double>(input_continuous.cols) / output_width;
+    double inv_scale_height = static_cast<double>(input_continuous.rows) / output_height;
 
-    cv::parallel_for_(cv::Range(0, output_height), [&](const cv::Range& range) {
-        for(int y_dst = range.start; y_dst < range.end; ++y_dst){
-            int y_src = std::min(static_cast<int>(round(y_dst / scale_height)), input.rows - 1);
+    // Precompute y_src and x_src mappings
+    std::vector<int> y_mapping(output_height);
+    #pragma omp parallel for
+    for(int y_dst = 0; y_dst < output_height; ++y_dst)
+    {
+        int y_src = static_cast<int>(round(y_dst * inv_scale_height));
+        y_src = std::min(y_src, input_continuous.rows - 1);
+        y_mapping[y_dst] = y_src;
+    }
 
-            if (channels == 1) {
-                const T* input_row = input.ptr<T>(y_src);
-                T* output_row = output.ptr<T>(y_dst);
+    std::vector<int> x_mapping(output_width);
+    #pragma omp parallel for
+    for(int x_dst = 0; x_dst < output_width; ++x_dst)
+    {
+        int x_src = static_cast<int>(round(x_dst * inv_scale_width));
+        x_src = std::min(x_src, input_continuous.cols - 1);
+        x_mapping[x_dst] = x_src;
+    }
 
-                int x = 0;
-                for(; x <= output_width - 8; x += 8){
-                    // 设置8个x_dst索引
-                    __m256i x_dst_v = _mm256_set_epi32(
-                        x+7, x+6, x+5, x+4, x+3, x+2, x+1, x
-                    );
+    // Process based on the number of channels
+    if(channels == 1)
+    {
+        // Single-channel image (Grayscale)
+        #pragma omp parallel for
+        for(int y_dst = 0; y_dst < output_height; ++y_dst)
+        {
+            int y_src = y_mapping[y_dst];
+            const T* input_row = input_continuous.ptr<T>(y_src);
+            T* output_row = output.ptr<T>(y_dst);
+            int x = 0;
 
-                    // 缩放并四舍五入
-                    __m256 scale_v = _mm256_set1_ps(static_cast<float>(scale_width));
-                    __m256 x_dst_f = _mm256_cvtepi32_ps(x_dst_v);
-                    __m256 x_src_f = _mm256_div_ps(x_dst_f, scale_v);
-                    __m256 x_src_rounded = _mm256_round_ps(x_src_f, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-                    __m256i x_src_i = _mm256_cvtps_epi32(x_src_rounded);
+            // Process 8 pixels at a time using AVX2
+            for(; x <= output_width - 8; x += 8)
+            {
+                // Load 8 x_src indices
+                __m256i x_src_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&x_mapping[x]));
 
-                    // Clamp x_src_i to [0, input.cols - 1]
-                    __m256i cols_minus_1 = _mm256_set1_epi32(input.cols - 1);
-                    x_src_i = _mm256_min_epi32(x_src_i, cols_minus_1);
-                    x_src_i = _mm256_max_epi32(x_src_i, _mm256_setzero_si256());
+                // Clamp indices to [0, cols - 1]
+                __m256i cols_minus_1 = _mm256_set1_epi32(input_continuous.cols - 1);
+                x_src_v = _mm256_min_epi32(x_src_v, cols_minus_1);
+                x_src_v = _mm256_max_epi32(x_src_v, _mm256_setzero_si256());
 
-                    // 存储x_src_i到数组
-                    alignas(32) int x_src_array[8];
-                    _mm256_store_si256((__m256i*)x_src_array, x_src_i);
+                // Extract indices into an array
+                alignas(32) int x_src_array[8];
+                _mm256_store_si256(reinterpret_cast<__m256i*>(x_src_array), x_src_v);
 
-                    // 加载像素值
-                    for(int i = 0; i < 8; ++i){
-                        output_row[x + i] = input_row[x_src_array[i]];
-                    }
+                // Gather pixel values
+                alignas(32) T pixels[8];
+                for(int i = 0; i < 8; ++i)
+                {
+                    pixels[i] = input_row[x_src_array[i]];
                 }
 
-                // 处理剩余像素
-                for(; x < output_width; ++x){
-                    int x_src = std::min(static_cast<int>(round(x / scale_width)), input.cols - 1);
-                    output_row[x] = input_row[x_src];
+                // Load pixels into AVX registers
+                __m256 pixels_v = _mm256_loadu_ps(reinterpret_cast<float*>(pixels));
+
+                // Convert pixels back to integers
+                __m256i pixels_i = _mm256_cvtps_epi32(pixels_v);
+
+                // Pack and store the results
+                alignas(32) int packed_pixels[8];
+                _mm256_store_si256(reinterpret_cast<__m256i*>(packed_pixels), pixels_i);
+                for(int i = 0; i < 8; ++i)
+                {
+                    output_row[x + i] = static_cast<T>(packed_pixels[i]);
                 }
             }
-            else if (channels == 3) {
-                const cv::Vec<T, 3>* input_row = input.ptr<cv::Vec<T, 3>>(y_src);
-                cv::Vec<T, 3>* output_row = output.ptr<cv::Vec<T, 3>>(y_dst);
 
-                int x = 0;
-                for(; x <= output_width - 8; x += 8){
-                    __m256i x_dst_v = _mm256_set_epi32(
-                        x+7, x+6, x+5, x+4, x+3, x+2, x+1, x
-                    );
+            // Handle remaining pixels
+            for(; x < output_width; ++x)
+            {
+                int x_src = x_mapping[x];
+                output_row[x] = input_row[x_src];
+            }
+        }
+    }
+    else if(channels == 3)
+    {
+        // Three-channel image (Color)
+        #pragma omp parallel for
+        for(int y_dst = 0; y_dst < output_height; ++y_dst)
+        {
+            int y_src = y_mapping[y_dst];
+            const cv::Vec<T, 3>* input_row = input_continuous.ptr<cv::Vec<T, 3>>(y_src);
+            cv::Vec<T, 3>* output_row = output.ptr<cv::Vec<T, 3>>(y_dst);
+            int x = 0;
 
-                    __m256 scale_v = _mm256_set1_ps(static_cast<float>(scale_width));
-                    __m256 x_dst_f = _mm256_cvtepi32_ps(x_dst_v);
-                    __m256 x_src_f = _mm256_div_ps(x_dst_f, scale_v);
-                    __m256 x_src_rounded = _mm256_round_ps(x_src_f, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-                    __m256i x_src_i = _mm256_cvtps_epi32(x_src_rounded);
+            // Process 8 pixels at a time using AVX2
+            for(; x <= output_width - 8; x += 8)
+            {
+                // Load 8 x_src indices
+                __m256i x_src_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&x_mapping[x]));
 
-                    __m256i cols_minus_1 = _mm256_set1_epi32(input.cols - 1);
-                    x_src_i = _mm256_min_epi32(x_src_i, cols_minus_1);
-                    x_src_i = _mm256_max_epi32(x_src_i, _mm256_setzero_si256());
+                // Clamp indices to [0, cols - 1]
+                __m256i cols_minus_1 = _mm256_set1_epi32(input_continuous.cols - 1);
+                x_src_v = _mm256_min_epi32(x_src_v, cols_minus_1);
+                x_src_v = _mm256_max_epi32(x_src_v, _mm256_setzero_si256());
 
-                    alignas(32) int x_src_array[8];
-                    _mm256_store_si256((__m256i*)x_src_array, x_src_i);
+                // Extract indices into an array
+                alignas(32) int x_src_array[8];
+                _mm256_store_si256(reinterpret_cast<__m256i*>(x_src_array), x_src_v);
 
-                    for(int i = 0; i < 8; ++i){
-                        output_row[x + i] = input_row[x_src_array[i]];
-                    }
+                // Gather pixel values
+                alignas(32) cv::Vec<T,3> pixels[8];
+                for(int i = 0; i < 8; ++i)
+                {
+                    pixels[i] = input_row[x_src_array[i]];
                 }
 
-                // 处理剩余像素
-                for(; x < output_width; ++x){
-                    int x_src = std::min(static_cast<int>(round(x / scale_width)), input.cols - 1);
-                    output_row[x] = input_row[x_src];
+                // Store the pixel values
+                for(int i = 0; i < 8; ++i)
+                {
+                    output_row[x + i] = pixels[i];
+                }
+            }
+
+            // Handle remaining pixels
+            for(; x < output_width; ++x)
+            {
+                int x_src = x_mapping[x];
+                output_row[x] = input_row[x_src];
+            }
+        }
+    }
+    else
+    {
+        // Handle other channel numbers (generic)
+        #pragma omp parallel for
+        for(int y_dst = 0; y_dst < output_height; ++y_dst)
+        {
+            int y_src = y_mapping[y_dst];
+            const T* input_row = input_continuous.ptr<T>(y_src);
+            T* output_row = output.ptr<T>(y_dst);
+            int x = 0;
+
+            for(; x < output_width; ++x)
+            {
+                int x_src = x_mapping[x];
+                for(int c = 0; c < channels; ++c)
+                {
+                    output_row[x * channels + c] = input_row[x_src * channels + c];
                 }
             }
         }
-    });
+    }
 
     return output;
 }
 
-// 多线程双线性插值模板实现，使用AVX
+// Explicit template instantiation
+template Mat resizeNN_AVX<uchar>(const Mat &, int, int, int);
+template Mat resizeNN_AVX<float>(const Mat &, int, int, int);
+
+// Multi-threaded Bilinear Interpolation with AVX Optimization
 template <typename T>
-Mat resizeBilinear(const Mat& input, int output_width, int output_height, int channels) {
-    Mat output(output_height, output_width, input.type());
+Mat resizeBilinear_AVX(const Mat &input, int output_width, int output_height, int channels)
+{
+    // Ensure the input matrix is continuous for optimized memory access
+    Mat input_continuous = input.isContinuous() ? input : input.clone();
+    Mat output(output_height, output_width, input_continuous.type());
 
-    double scale_width = static_cast<double>(output_width) / input.cols;
-    double scale_height = static_cast<double>(output_height) / input.rows;
+    // Calculate scaling factors
+    double scale_width = static_cast<double>(output_width) / input_continuous.cols;
+    double scale_height = static_cast<double>(output_height) / input_continuous.rows;
 
-    cv::parallel_for_(cv::Range(0, output_height), [&](const cv::Range& range) {
-        for(int y_dst = range.start; y_dst < range.end; ++y_dst){
-            double y_src_f = (y_dst + 0.5) / scale_height - 0.5;
-            int y1 = std::max(0, std::min(static_cast<int>(floor(y_src_f)), input.rows - 1));
-            int y2 = std::max(0, std::min(y1 + 1, input.rows - 1));
-            double dy = y_src_f - y1;
+    // Precompute y_src mappings
+    std::vector<int> y1_mapping(output_height);
+    std::vector<int> y2_mapping(output_height);
+    std::vector<double> dy_mapping(output_height);
 
-            if (channels == 1) {
-                T* output_row = output.ptr<T>(y_dst);
-                int x = 0;
+    #pragma omp parallel for
+    for(int y_dst = 0; y_dst < output_height; ++y_dst)
+    {
+        double y_src_f = (y_dst + 0.5) / scale_height - 0.5;
+        int y1 = static_cast<int>(floor(y_src_f));
+        int y2 = y1 + 1;
+        double dy = y_src_f - y1;
 
-                for(; x <= output_width - 8; x += 8){
-                    // 设置8个x_dst索引
-                    __m256i x_dst_v = _mm256_set_epi32(
-                        x+7, x+6, x+5, x+4, x+3, x+2, x+1, x
-                    );
+        // Clamp y coordinates
+        y1 = std::max(0, std::min(y1, input_continuous.rows - 1));
+        y2 = std::max(0, std::min(y2, input_continuous.rows - 1));
+        dy_mapping[y_dst] = dy;
+        y1_mapping[y_dst] = y1;
+        y2_mapping[y_dst] = y2;
+    }
 
-                    // 缩放
-                    __m256 scale_v = _mm256_set1_ps(static_cast<float>(scale_width));
-                    __m256 x_dst_f = _mm256_cvtepi32_ps(x_dst_v);
-                    __m256 x_src_f = _mm256_div_ps(x_dst_f, scale_v);
-                    __m256 x_src_floor = _mm256_floor_ps(x_src_f);
-                    __m256 dx_v = _mm256_sub_ps(x_src_f, x_src_floor);
-                    __m256i x1_i = _mm256_cvtps_epi32(x_src_floor);
-                    __m256i x2_i = _mm256_add_epi32(x1_i, _mm256_set1_epi32(1));
+    // Precompute x_src mappings
+    std::vector<int> x1_mapping(output_width);
+    std::vector<int> x2_mapping(output_width);
+    std::vector<double> dx_mapping(output_width);
 
-                    // Clamp
-                    __m256i cols_minus_1 = _mm256_set1_epi32(input.cols - 1);
-                    x1_i = _mm256_min_epi32(x1_i, cols_minus_1);
-                    x1_i = _mm256_max_epi32(x1_i, _mm256_setzero_si256());
-                    x2_i = _mm256_min_epi32(x2_i, cols_minus_1);
-                    x2_i = _mm256_max_epi32(x2_i, _mm256_setzero_si256());
+    #pragma omp parallel for
+    for(int x_dst = 0; x_dst < output_width; ++x_dst)
+    {
+        double x_src_f = (x_dst + 0.5) / scale_width - 0.5;
+        int x1 = static_cast<int>(floor(x_src_f));
+        int x2 = x1 + 1;
+        double dx = x_src_f - x1;
 
-                    // 存储索引
-                    alignas(32) int indices1[8];
-                    alignas(32) int indices2[8];
-                    _mm256_store_si256((__m256i*)indices1, x1_i);
-                    _mm256_store_si256((__m256i*)indices2, x2_i);
+        // Clamp x coordinates
+        x1 = std::max(0, std::min(x1, input_continuous.cols - 1));
+        x2 = std::max(0, std::min(x2, input_continuous.cols - 1));
+        dx_mapping[x_dst] = dx;
+        x1_mapping[x_dst] = x1;
+        x2_mapping[x_dst] = x2;
+    }
 
-                    // 加载像素值
-                    double I11[8], I21[8], I12[8], I22[8];
-                    for(int i = 0; i < 8; ++i){
-                        I11[i] = input.ptr<T>(y1)[indices1[i]];
-                        I21[i] = input.ptr<T>(y1)[indices2[i]];
-                        I12[i] = input.ptr<T>(y2)[indices1[i]];
-                        I22[i] = input.ptr<T>(y2)[indices2[i]];
-                    }
+    // Process based on the number of channels
+    if(channels == 1)
+    {
+        // Single-channel image (Grayscale)
+        #pragma omp parallel for
+        for(int y_dst = 0; y_dst < output_height; ++y_dst)
+        {
+            int y1 = y1_mapping[y_dst];
+            int y2 = y2_mapping[y_dst];
+            double dy = dy_mapping[y_dst];
+            const T* row1 = input_continuous.ptr<T>(y1);
+            const T* row2 = input_continuous.ptr<T>(y2);
+            T* output_row = output.ptr<T>(y_dst);
+            int x = 0;
 
-                    // 计算插值
-                    for(int i = 0; i < 8; ++i){
-                        double val = (1 - dx_v[i]) * (1 - dy) * I11[i] +
-                                     dx_v[i] * (1 - dy) * I21[i] +
-                                     (1 - dx_v[i]) * dy * I12[i] +
-                                     dx_v[i] * dy * I22[i];
-                        output_row[x + i] = clamp_and_round<T>(val);
-                    }
+            // Process 8 pixels at a time using AVX2
+            for(; x <= output_width - 8; x += 8)
+            {
+                // Load 8 x1 and x2 indices
+                __m256i x1_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&x1_mapping[x]));
+                __m256i x2_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&x2_mapping[x]));
+
+                // Clamp indices to [0, cols - 1]
+                __m256i cols_minus_1 = _mm256_set1_epi32(input_continuous.cols - 1);
+                x1_v = _mm256_min_epi32(x1_v, cols_minus_1);
+                x1_v = _mm256_max_epi32(x1_v, _mm256_setzero_si256());
+                x2_v = _mm256_min_epi32(x2_v, cols_minus_1);
+                x2_v = _mm256_max_epi32(x2_v, _mm256_setzero_si256());
+
+                // Extract indices into arrays
+                alignas(32) int x1_array[8];
+                alignas(32) int x2_array[8];
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(x1_array), x1_v);
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(x2_array), x2_v);
+
+                // Gather pixel values
+                alignas(32) T pixels1[8];
+                alignas(32) T pixels2[8];
+                for(int i = 0; i < 8; ++i)
+                {
+                    pixels1[i] = row1[x1_array[i]];
+                    pixels2[i] = row2[x2_array[i]];
                 }
 
-                // 处理剩余像素
-                for(; x < output_width; ++x){
-                    double x_src_f = (x + 0.5) / scale_width - 0.5;
-                    int x1 = std::max(0, std::min(static_cast<int>(floor(x_src_f)), input.cols - 1));
-                    int x2 = std::max(0, std::min(x1 + 1, input.cols - 1));
-                    double dx = x_src_f - x1;
+                // Perform bilinear interpolation
+                alignas(32) double interp_vals[8];
+                for(int i = 0; i < 8; ++i)
+                {
+                    interp_vals[i] = (1 - dx_mapping[x + i]) * (1 - dy) * pixels1[i] +
+                                     dx_mapping[x + i] * (1 - dy) * pixels2[i];
+                }
 
-                    double I11 = input.ptr<T>(y1)[x1];
-                    double I21 = input.ptr<T>(y1)[x2];
-                    double I12 = input.ptr<T>(y2)[x1];
-                    double I22 = input.ptr<T>(y2)[x2];
-
-                    double val = (1 - dx) * (1 - dy) * I11 +
-                                 dx * (1 - dy) * I21 +
-                                 (1 - dx) * dy * I12 +
-                                 dx * dy * I22;
-
-                    output_row[x] = clamp_and_round<T>(val);
+                // Clamp and store the results
+                for(int i = 0; i < 8; ++i)
+                {
+                    output_row[x + i] = clamp_and_round<T>(interp_vals[i]);
                 }
             }
-            else if (channels == 3) {
-                cv::Vec<T, 3>* output_row = output.ptr<cv::Vec<T, 3>>(y_dst);
-                int x = 0;
 
-                for(; x <= output_width - 8; x += 8){
-                    __m256i x_dst_v = _mm256_set_epi32(
-                        x+7, x+6, x+5, x+4, x+3, x+2, x+1, x
-                    );
+            // Handle remaining pixels
+            for(; x < output_width; ++x)
+            {
+                int x1 = x1_mapping[x];
+                int x2 = x2_mapping[x];
+                double dx = dx_mapping[x];
+                double I11 = row1[x1];
+                double I21 = row1[x2];
+                double val = (1 - dx) * I11 + dx * I21;
+                output_row[x] = clamp_and_round<T>(val * (1 - dy) + val * dy); // Adjust according to bilinear formula
+            }
+        }
+    }
+    else if(channels == 3)
+    {
+        // Three-channel image (Color)
+        #pragma omp parallel for
+        for(int y_dst = 0; y_dst < output_height; ++y_dst)
+        {
+            int y1 = y1_mapping[y_dst];
+            int y2 = y2_mapping[y_dst];
+            double dy = dy_mapping[y_dst];
+            const cv::Vec<T, 3>* row1 = input_continuous.ptr<cv::Vec<T, 3>>(y1);
+            const cv::Vec<T, 3>* row2 = input_continuous.ptr<cv::Vec<T, 3>>(y2);
+            cv::Vec<T, 3>* output_row = output.ptr<cv::Vec<T, 3>>(y_dst);
+            int x = 0;
 
-                    __m256 scale_v = _mm256_set1_ps(static_cast<float>(scale_width));
-                    __m256 x_dst_f = _mm256_cvtepi32_ps(x_dst_v);
-                    __m256 x_src_f = _mm256_div_ps(x_dst_f, scale_v);
-                    __m256 x_src_floor = _mm256_floor_ps(x_src_f);
-                    __m256 dx_v = _mm256_sub_ps(x_src_f, x_src_floor);
-                    __m256i x1_i = _mm256_cvtps_epi32(x_src_floor);
-                    __m256i x2_i = _mm256_add_epi32(x1_i, _mm256_set1_epi32(1));
+            // Process 8 pixels at a time using AVX2
+            for(; x <= output_width - 8; x += 8)
+            {
+                // Load 8 x1 and x2 indices
+                __m256i x1_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&x1_mapping[x]));
+                __m256i x2_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&x2_mapping[x]));
 
-                    __m256i cols_minus_1 = _mm256_set1_epi32(input.cols - 1);
-                    x1_i = _mm256_min_epi32(x1_i, cols_minus_1);
-                    x1_i = _mm256_max_epi32(x1_i, _mm256_setzero_si256());
-                    x2_i = _mm256_min_epi32(x2_i, cols_minus_1);
-                    x2_i = _mm256_max_epi32(x2_i, _mm256_setzero_si256());
+                // Clamp indices to [0, cols - 1]
+                __m256i cols_minus_1 = _mm256_set1_epi32(input_continuous.cols - 1);
+                x1_v = _mm256_min_epi32(x1_v, cols_minus_1);
+                x1_v = _mm256_max_epi32(x1_v, _mm256_setzero_si256());
+                x2_v = _mm256_min_epi32(x2_v, cols_minus_1);
+                x2_v = _mm256_max_epi32(x2_v, _mm256_setzero_si256());
 
-                    alignas(32) int indices1[8];
-                    alignas(32) int indices2[8];
-                    _mm256_store_si256((__m256i*)indices1, x1_i);
-                    _mm256_store_si256((__m256i*)indices2, x2_i);
+                // Extract indices into arrays
+                alignas(32) int x1_array[8];
+                alignas(32) int x2_array[8];
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(x1_array), x1_v);
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(x2_array), x2_v);
 
-                    // 加载像素值并计算插值
-                    for(int i = 0; i < 8; ++i){
-                        double I11[3] = { 
-                            static_cast<double>(input.ptr<cv::Vec<T, 3>>(y1)[indices1[i]][0]),
-                            static_cast<double>(input.ptr<cv::Vec<T, 3>>(y1)[indices1[i]][1]),
-                            static_cast<double>(input.ptr<cv::Vec<T, 3>>(y1)[indices1[i]][2])
-                        };
-                        double I21[3] = { 
-                            static_cast<double>(input.ptr<cv::Vec<T, 3>>(y1)[indices2[i]][0]),
-                            static_cast<double>(input.ptr<cv::Vec<T, 3>>(y1)[indices2[i]][1]),
-                            static_cast<double>(input.ptr<cv::Vec<T, 3>>(y1)[indices2[i]][2])
-                        };
-                        double I12[3] = { 
-                            static_cast<double>(input.ptr<cv::Vec<T, 3>>(y2)[indices1[i]][0]),
-                            static_cast<double>(input.ptr<cv::Vec<T, 3>>(y2)[indices1[i]][1]),
-                            static_cast<double>(input.ptr<cv::Vec<T, 3>>(y2)[indices1[i]][2])
-                        };
-                        double I22[3] = { 
-                            static_cast<double>(input.ptr<cv::Vec<T, 3>>(y2)[indices2[i]][0]),
-                            static_cast<double>(input.ptr<cv::Vec<T, 3>>(y2)[indices2[i]][1]),
-                            static_cast<double>(input.ptr<cv::Vec<T, 3>>(y2)[indices2[i]][2])
-                        };
+                // Gather pixel values
+                alignas(32) cv::Vec<T, 3> pixels1[8];
+                alignas(32) cv::Vec<T, 3> pixels2[8];
+                for(int i = 0; i < 8; ++i)
+                {
+                    pixels1[i] = row1[x1_array[i]];
+                    pixels2[i] = row2[x2_array[i]];
+                }
 
-                        cv::Vec<double, 3> val;
-                        for(int c = 0; c < 3; ++c){
-                            val[c] = (1 - dx_v[i]) * (1 - dy) * I11[c] +
-                                     dx_v[i] * (1 - dy) * I21[c] +
-                                     (1 - dx_v[i]) * dy * I12[c] +
-                                     dx_v[i] * dy * I22[c];
-                        }
-
-                        // 赋值并确保每个通道正确
-                        output_row[x + i][0] = clamp_and_round<T>(val[0]);
-                        output_row[x + i][1] = clamp_and_round<T>(val[1]);
-                        output_row[x + i][2] = clamp_and_round<T>(val[2]);
+                // Perform bilinear interpolation for each pixel
+                alignas(32) cv::Vec<double, 3> interp_vals[8];
+                for(int i = 0; i < 8; ++i)
+                {
+                    for(int c = 0; c < 3; ++c)
+                    {
+                        interp_vals[i][c] = (1 - dx_mapping[x + i]) * (1 - dy) * pixels1[i][c] +
+                                             dx_mapping[x + i] * (1 - dy) * pixels2[i][c];
                     }
                 }
 
-                // 处理剩余像素
-                for(; x < output_width; ++x){
-                    double x_src_f = (x + 0.5) / scale_width - 0.5;
-                    int x1 = std::max(0, std::min(static_cast<int>(floor(x_src_f)), input.cols - 1));
-                    int x2 = std::max(0, std::min(x1 + 1, input.cols - 1));
-                    double dx = x_src_f - x1;
+                // Clamp and store the results
+                for(int i = 0; i < 8; ++i)
+                {
+                    output_row[x + i] = cv::Vec<T, 3>(
+                        clamp_and_round<T>(interp_vals[i][0]),
+                        clamp_and_round<T>(interp_vals[i][1]),
+                        clamp_and_round<T>(interp_vals[i][2])
+                    );
+                }
+            }
 
-                    cv::Vec<double, 3> I11 = input.ptr<cv::Vec<T, 3>>(y1)[x1];
-                    cv::Vec<double, 3> I21 = input.ptr<cv::Vec<T, 3>>(y1)[x2];
-                    cv::Vec<double, 3> I12 = input.ptr<cv::Vec<T, 3>>(y2)[x1];
-                    cv::Vec<double, 3> I22 = input.ptr<cv::Vec<T, 3>>(y2)[x2];
+            // Handle remaining pixels
+            for(; x < output_width; ++x)
+            {
+                int x1 = x1_mapping[x];
+                int x2 = x2_mapping[x];
+                double dx = dx_mapping[x];
+                double I11 = row1[x1][0];
+                double I21 = row1[x2][0];
+                double I12 = row2[x1][0];
+                double I22 = row2[x2][0];
 
-                    cv::Vec<double, 3> val;
-                    for(int c = 0; c < 3; ++c){
-                        val[c] = (1 - dx) * (1 - dy) * I11[c] +
-                                 dx * (1 - dy) * I21[c] +
-                                 (1 - dx) * dy * I12[c] +
-                                 dx * dy * I22[c];
-                    }
+                double I13 = row1[x1][1];
+                double I23 = row2[x2][1];
+                double I14 = row1[x1][2];
+                double I24 = row2[x2][2];
 
-                    output_row[x][0] = clamp_and_round<T>(val[0]);
-                    output_row[x][1] = clamp_and_round<T>(val[1]);
-                    output_row[x][2] = clamp_and_round<T>(val[2]);
+                // Bilinear interpolation for each channel
+                cv::Vec<double, 3> val;
+                for(int c = 0; c < 3; ++c)
+                {
+                    double I11_c = row1[x1][c];
+                    double I21_c = row1[x2][c];
+                    double I12_c = row2[x1][c];
+                    double I22_c = row2[x2][c];
+
+                    double interpolated = (1 - dx) * (1 - dy) * I11_c +
+                                          dx * (1 - dy) * I21_c +
+                                          (1 - dx) * dy * I12_c +
+                                          dx * dy * I22_c;
+
+                    val[c] = clamp_and_round<T>(interpolated);
+                }
+
+                output_row[x] = cv::Vec<T, 3>(
+                    static_cast<T>(val[0]),
+                    static_cast<T>(val[1]),
+                    static_cast<T>(val[2])
+                );
+            }
+        }
+    }
+    else
+    {
+        // Handle other channel numbers (generic)
+        #pragma omp parallel for
+        for(int y_dst = 0; y_dst < output_height; ++y_dst)
+        {
+            int y_src = dy_mapping[y_dst];
+            const T* input_row = input_continuous.ptr<T>(y_src);
+            T* output_row = output.ptr<T>(y_dst);
+            int x = 0;
+
+            for(; x < output_width; ++x)
+            {
+                int x_src = dx_mapping[x];
+                for(int c = 0; c < channels; ++c)
+                {
+                    output_row[x * channels + c] = input_row[x_src * channels + c];
                 }
             }
         }
-    });
+    }
 
     return output;
 }
-// 多线程最近邻插值实现
-Mat resizeNN_MT(const Mat& input, int output_width, int output_height) {
+
+// Explicit template instantiation
+template Mat resizeBilinear_AVX<uchar>(const Mat &, int, int, int);
+template Mat resizeBilinear_AVX<float>(const Mat &, int, int, int);
+
+// Multi-threaded Nearest Neighbor Interpolation
+Mat resizeNN_MT(const Mat &input, int output_width, int output_height)
+{
     int channels = input.channels();
     int depth = input.depth();
 
-    switch(depth) {
+    switch (depth)
+    {
         case CV_8U:
-            return resizeNN<uchar>(input, output_width, output_height, channels);
+            return resizeNN_AVX<uchar>(input, output_width, output_height, channels);
         case CV_16U:
-            return resizeNN<ushort>(input, output_width, output_height, channels);
+            return resizeNN_AVX<ushort>(input, output_width, output_height, channels);
         case CV_32F:
-            return resizeNN<float>(input, output_width, output_height, channels);
+            return resizeNN_AVX<float>(input, output_width, output_height, channels);
         default:
             throw std::runtime_error("Unsupported data type for resizeNN_MT");
     }
 }
 
-// 多线程双线性插值实现
-Mat resizeBilinear_MT(const Mat& input, int output_width, int output_height) {
+// Multi-threaded Bilinear Interpolation
+Mat resizeBilinear_MT(const Mat &input, int output_width, int output_height)
+{
     int channels = input.channels();
     int depth = input.depth();
 
-    switch(depth) {
+    switch (depth)
+    {
         case CV_8U:
-            return resizeBilinear<uchar>(input, output_width, output_height, channels);
+            return resizeBilinear_AVX<uchar>(input, output_width, output_height, channels);
         case CV_16U:
-            return resizeBilinear<ushort>(input, output_width, output_height, channels);
+            return resizeBilinear_AVX<ushort>(input, output_width, output_height, channels);
         case CV_32F:
-            return resizeBilinear<float>(input, output_width, output_height, channels);
+            return resizeBilinear_AVX<float>(input, output_width, output_height, channels);
         default:
             throw std::runtime_error("Unsupported data type for resizeBilinear_MT");
     }
 }
 
-// 单线程最近邻插值模板实现
+// Single-threaded Nearest Neighbor Interpolation Implementation
 template <typename T>
-Mat resizeNN_ST_impl(const Mat& input, int output_width, int output_height, int channels) {
+Mat resizeNN_ST_impl(const Mat &input, int output_width, int output_height, int channels)
+{
     Mat output(output_height, output_width, input.type());
 
     double scale_width = static_cast<double>(output_width) / input.cols;
     double scale_height = static_cast<double>(output_height) / input.rows;
 
-    for(int y_dst = 0; y_dst < output_height; ++y_dst){
-        // 反向映射到输入图像的y坐标
-        int y_src = static_cast<int>(round(y_dst / scale_height));
+    for(int y_dst = 0; y_dst < output_height; ++y_dst)
+    {
+        // Map output y to input y
+        int y_src = static_cast<int>(round(y_dst * (input.rows / static_cast<double>(output_height))));
         y_src = std::min(y_src, input.rows - 1);
 
-        if (channels == 1) {
+        if (channels == 1)
+        {
             const T* input_row = input.ptr<T>(y_src);
             T* output_row = output.ptr<T>(y_dst);
-            for(int x_dst = 0; x_dst < output_width; ++x_dst){
-                int x_src = static_cast<int>(round(x_dst / scale_width));
+            for(int x_dst = 0; x_dst < output_width; ++x_dst)
+            {
+                int x_src = static_cast<int>(round(x_dst * (input.cols / static_cast<double>(output_width))));
                 x_src = std::min(x_src, input.cols - 1);
                 output_row[x_dst] = input_row[x_src];
             }
         }
-        else if (channels == 3) {
+        else if (channels == 3)
+        {
             const cv::Vec<T, 3>* input_row = input.ptr<cv::Vec<T, 3>>(y_src);
             cv::Vec<T, 3>* output_row = output.ptr<cv::Vec<T, 3>>(y_dst);
-            for(int x_dst = 0; x_dst < output_width; ++x_dst){
-                int x_src = static_cast<int>(round(x_dst / scale_width));
+            for(int x_dst = 0; x_dst < output_width; ++x_dst)
+            {
+                int x_src = static_cast<int>(round(x_dst * (input.cols / static_cast<double>(output_width))));
                 x_src = std::min(x_src, input.cols - 1);
                 output_row[x_dst] = input_row[x_src];
             }
@@ -378,16 +539,18 @@ Mat resizeNN_ST_impl(const Mat& input, int output_width, int output_height, int 
     return output;
 }
 
-// 单线程双线性插值模板实现
+// Single-threaded Bilinear Interpolation Implementation
 template <typename T>
-Mat resizeBilinear_ST_impl(const Mat& input, int output_width, int output_height, int channels) {
+Mat resizeBilinear_ST_impl(const Mat &input, int output_width, int output_height, int channels)
+{
     Mat output(output_height, output_width, input.type());
 
     double scale_width = static_cast<double>(output_width) / input.cols;
     double scale_height = static_cast<double>(output_height) / input.rows;
 
-    for(int y_dst = 0; y_dst < output_height; ++y_dst){
-        // 反向映射到输入图像的y坐标
+    for(int y_dst = 0; y_dst < output_height; ++y_dst)
+    {
+        // Map output y to input y
         double y_src_f = (y_dst + 0.5) / scale_height - 0.5;
         int y1 = static_cast<int>(floor(y_src_f));
         int y2 = y1 + 1;
@@ -397,20 +560,20 @@ Mat resizeBilinear_ST_impl(const Mat& input, int output_width, int output_height
         y1 = std::max(0, std::min(y1, input.rows - 1));
         y2 = std::max(0, std::min(y2, input.rows - 1));
 
-        if (channels == 1) {
-            T* output_row = output.ptr<T>(y_dst);
-            for(int x_dst = 0; x_dst < output_width; ++x_dst){
-                // 反向映射到输入图像的x坐标
-                double x_src_f = (x_dst + 0.5) / scale_width - 0.5;
-                int x1 = static_cast<int>(floor(x_src_f));
-                int x2 = x1 + 1;
-                double dx = x_src_f - x1;
+        for(int x_dst = 0; x_dst < output_width; ++x_dst)
+        {
+            // Map output x to input x
+            double x_src_f = (x_dst + 0.5) / scale_width - 0.5;
+            int x1 = static_cast<int>(floor(x_src_f));
+            int x2 = x1 + 1;
+            double dx = x_src_f - x1;
 
-                // Clamp x coordinates
-                x1 = std::max(0, std::min(x1, input.cols - 1));
-                x2 = std::max(0, std::min(x2, input.cols - 1));
+            // Clamp x coordinates
+            x1 = std::max(0, std::min(x1, input.cols - 1));
+            x2 = std::max(0, std::min(x2, input.cols - 1));
 
-                // 获取四个邻近像素的值
+            if (channels == 1)
+            {
                 const T* row1 = input.ptr<T>(y1);
                 const T* row2 = input.ptr<T>(y2);
                 double I11 = row1[x1];
@@ -418,30 +581,16 @@ Mat resizeBilinear_ST_impl(const Mat& input, int output_width, int output_height
                 double I12 = row2[x1];
                 double I22 = row2[x2];
 
-                // 计算双线性插值结果
+                // Bilinear interpolation
                 double val = (1 - dx) * (1 - dy) * I11 +
                              dx * (1 - dy) * I21 +
                              (1 - dx) * dy * I12 +
                              dx * dy * I22;
 
-                // 赋值给输出图像，确保不溢出
-                output_row[x_dst] = clamp_and_round<T>(val);
+                output.at<T>(y_dst, x_dst) = clamp_and_round<T>(val);
             }
-        }
-        else if (channels == 3) {
-            cv::Vec<T, 3>* output_row = output.ptr<cv::Vec<T, 3>>(y_dst);
-            for(int x_dst = 0; x_dst < output_width; ++x_dst){
-                // 反向映射到输入图像的x坐标
-                double x_src_f = (x_dst + 0.5) / scale_width - 0.5;
-                int x1 = static_cast<int>(floor(x_src_f));
-                int x2 = x1 + 1;
-                double dx = x_src_f - x1;
-
-                // Clamp x coordinates
-                x1 = std::max(0, std::min(x1, input.cols - 1));
-                x2 = std::max(0, std::min(x2, input.cols - 1));
-
-                // 获取四个邻近像素的值
+            else if (channels == 3)
+            {
                 const cv::Vec<T, 3>* row1 = input.ptr<cv::Vec<T, 3>>(y1);
                 const cv::Vec<T, 3>* row2 = input.ptr<cv::Vec<T, 3>>(y2);
                 cv::Vec<T, 3> I11 = row1[x1];
@@ -449,9 +598,10 @@ Mat resizeBilinear_ST_impl(const Mat& input, int output_width, int output_height
                 cv::Vec<T, 3> I12 = row2[x1];
                 cv::Vec<T, 3> I22 = row2[x2];
 
-                // 计算双线性插值结果
+                // Bilinear interpolation for each channel
                 cv::Vec<double, 3> val;
-                for(int c = 0; c < 3; ++c){
+                for(int c = 0; c < 3; ++c)
+                {
                     val[c] = (1 - dx) * (1 - dy) * I11[c] +
                              dx * (1 - dy) * I21[c] +
                              (1 - dx) * dy * I12[c] +
@@ -459,11 +609,10 @@ Mat resizeBilinear_ST_impl(const Mat& input, int output_width, int output_height
                     val[c] = clamp_and_round<T>(val[c]);
                 }
 
-                // 赋值给输出图像
-                output_row[x_dst] = cv::Vec<T, 3>(
-                    static_cast<T>(val[0]),
-                    static_cast<T>(val[1]),
-                    static_cast<T>(val[2])
+                output.at<cv::Vec<T, 3>>(y_dst, x_dst) = cv::Vec<T, 3>(
+                        static_cast<T>(val[0]),
+                        static_cast<T>(val[1]),
+                        static_cast<T>(val[2])
                 );
             }
         }
@@ -472,8 +621,9 @@ Mat resizeBilinear_ST_impl(const Mat& input, int output_width, int output_height
     return output;
 }
 
-// 单线程最近邻插值实现
-Mat resizeNN_ST(const Mat& input, int output_width, int output_height) {
+// Single-threaded Nearest Neighbor Implementation
+Mat resizeNN_ST(const Mat &input, int output_width, int output_height)
+{
     int channels = input.channels();
     int depth = input.depth();
 
@@ -489,8 +639,9 @@ Mat resizeNN_ST(const Mat& input, int output_width, int output_height) {
     }
 }
 
-// 单线程双线性插值实现
-Mat resizeBilinear_ST(const Mat& input, int output_width, int output_height) {
+// Single-threaded Bilinear Interpolation Implementation
+Mat resizeBilinear_ST(const Mat &input, int output_width, int output_height)
+{
     int channels = input.channels();
     int depth = input.depth();
 
@@ -506,22 +657,39 @@ Mat resizeBilinear_ST(const Mat& input, int output_width, int output_height) {
     }
 }
 
-// 实现自定义的resize函数
-void resize_custom(const cv::Mat& input, cv::Mat& output, const cv::Size& new_size, InterpolationMethod method) {
-    if(method == NEAREST_NEIGHBOR){
-
+// Implementation of custom resize function
+void resize_custom(const cv::Mat &input, cv::Mat &output, const cv::Size &new_size, InterpolationMethod method, bool MT)
+{
+    if(MT)
+    {
+        if(method == NEAREST_NEIGHBOR)
+        {
             output = resizeNN_MT(input, new_size.width, new_size.height);
-    
-    }
-    else if(method == BILINEAR){
-
+        }
+        else if(method == BILINEAR)
+        {
             output = resizeBilinear_MT(input, new_size.width, new_size.height);
-        
-    }
-    else{
-        // 默认使用最近邻插值
-
+        }
+        else
+        {
+            // Default to nearest neighbor
             output = resizeNN_MT(input, new_size.width, new_size.height);
-        
+        }
+    }
+    else
+    {
+        if(method == NEAREST_NEIGHBOR)
+        {
+            output = resizeNN_ST(input, new_size.width, new_size.height);
+        }
+        else if(method == BILINEAR)
+        {
+            output = resizeBilinear_ST(input, new_size.width, new_size.height);
+        }
+        else
+        {
+            // Default to nearest neighbor
+            output = resizeNN_ST(input, new_size.width, new_size.height);
+        }
     }
 }
