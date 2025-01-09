@@ -507,24 +507,17 @@ Mat resizeBilinear_ST(const Mat& input, int output_width, int output_height) {
 }
 
 // 实现自定义的resize函数
-void resize_custom(const cv::Mat& input, cv::Mat& output, const cv::Size& new_size, InterpolationMethod method) {
+void resize_custom(const cv::Mat& input, cv::Mat& output, const cv::Size& new_size, InterpolationMethod method,bool MT) {
     if(method == NEAREST_NEIGHBOR){
-
-            
-
             output = resizeNN_MT(input, new_size.width, new_size.height);
     
     }
     else if(method == BILINEAR){
-
-            
             output = resizeBilinear_MT(input, new_size.width, new_size.height);
         
     }
     else{
         // 默认使用最近邻插值
-
-
             output = resizeNN_MT(input, new_size.width, new_size.height);
         
     }

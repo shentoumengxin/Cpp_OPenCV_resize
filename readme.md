@@ -1,7 +1,7 @@
 # OpenCV-based Resize Function Implementation and Optimization
 
 **Team Members:** 12311124 Zhang Zihan 12311624 Lin Pinhao 12312210 Liu Ruihan 
-**Email:** [12311124@mail.sustech.edu.cn](mailto:12332469@mail.sustech.edu.cn)  
+
 
 ---
 
@@ -39,7 +39,7 @@ This is achieved through C++ template programming, enabling seamless handling of
 
 ### 1.5. Usage Instructions
 
-  This CMake configuration sets up a C++17 project with OpenCV dependencies, enables performance optimizations through AVX2 and FMA instruction sets (for supported compilers), and ensures that the necessary OpenCV libraries are linked. It also defines the source files and compiles them into an executable. Please prepare your [OpenCV]((https://opencv.org/)) environment at first.
+  This CMake configuration sets up a C++17 project with OpenCV dependencies, we only support arvx2 for x86-64 ecosystem enables performance optimizations through AVX2 and FMA instruction sets (for supported compilers), and ensures that the necessary OpenCV libraries are linked. It also defines the source files and compiles them into an executable. Please prepare your [OpenCV]((https://opencv.org/)) environment at first.
 
 ```cmd
 ~/opencv_resize_custom/build:cmake ..
@@ -71,33 +71,56 @@ To utilize the custom resize function in your project, follow these steps:
    cv::imwrite("resized_image.jpg", output);
    // or
    cv::imshow("Resized Image", output);
-
-
-
 ------
 
 ## 2. Comparison Between Single-threaded and Multi-threaded Implementations
 
-### 2.1. Performance Enhancements
+### Key Observations:
 
-- **Single-threaded Implementation:**
-  Processes each pixel sequentially, resulting in straightforward but potentially slower execution times, especially for large images.
-- **Multi-threaded Implementation:**
-  Utilizes OpenCV's `parallel_for_` in combination with AVX SIMD instructions to process multiple pixels concurrently across different CPU cores. This parallelism significantly reduces execution time, making the resize operations more efficient.
+#### 1. **Bilinear Interpolation**:
 
-### 2.2. Accuracy Assessment
+- **Multi-threaded (MT)**: Performs significantly better than single-threaded mode, especially for high-resolution images (e.g., original width > 1000). The performance improvement becomes more evident as image size increases.
+- **Single-threaded (ST)**: Execution time increases linearly with resolution. Due to the complexity of bilinear interpolation calculations, single-threaded performance is limited and slower compared to multi-threaded processing.
 
-- **Nearest Neighbor Interpolation:**
-  Both single-threaded and multi-threaded implementations achieve exact pixel value matches with OpenCV's native `resize` function, resulting in perfect PSNR values (`∞ dB`).
-- **Bilinear Interpolation:**
-  The single-threaded implementation closely matches OpenCV's results with high PSNR values. The multi-threaded version maintains high accuracy, with minor discrepancies potentially arising from floating-point precision differences inherent in parallel processing.
+#### 2. **Nearest Neighbor Interpolation**:
 
-### 2.3. Resource Utilization and Scalability
+- **Multi-threaded (MT)**: Shows slight performance improvement over single-threaded mode, but the improvement is less dramatic compared to bilinear interpolation. This is because nearest neighbor interpolation is computationally simpler, leaving less room for optimization through parallelization.
+- **Single-threaded (ST)**: Time increases moderately with resolution but remains significantly faster than bilinear interpolation in all cases due to its simplicity.
 
-- **Single-threaded:**
-  Limited by the processing speed of a single CPU core.
-- **Multi-threaded:**
-  Scales effectively with the number of available CPU cores, utilizing system resources more efficiently and handling larger images with improved performance.
+#### 3. **Single-threaded vs Multi-threaded Comparison**:
+
+- **High-resolution scenarios**: Multi-threaded processing offers significant advantages, especially for bilinear interpolation. For example, when the original width exceeds 1200, the gap between single-threaded and multi-threaded performance becomes much larger.
+- **Low-resolution scenarios**: Multi-threaded advantages are less noticeable, as the overhead of thread management diminishes the benefits of parallelization for smaller image sizes.
+
+#### 4. **Nearest Neighbor vs Bilinear Interpolation**:
+
+- Nearest Neighbor Interpolation is faster in both single-threaded and multi-threaded modes, as it only requires selecting the nearest pixel value without additional computations.
+- Bilinear Interpolation, while slower, delivers smoother results by performing weighted averaging of adjacent pixels, which significantly enhances image quality.
+
+------
+
+### Image Quality Analysis (PSNR Comparison):
+
+To further evaluate the effectiveness of the interpolation methods, we compared them to **OpenCV's built-in `resize` function** using **PSNR (Peak Signal-to-Noise Ratio)** as the metric for image quality.
+
+1. Bilinear Interpolation:
+   - Achieved significantly higher PSNR values compared to Nearest Neighbor Interpolation, indicating superior image quality.
+   - Particularly effective for large scaling factors, where smoother edges and better preservation of details are required.
+2. Nearest Neighbor Interpolation:
+   - Delivered lower PSNR values, indicating lower image quality. The results often show pixelation or jagged edges, especially at larger scaling factors.
+3. OpenCV's `resize` Function:
+   - Performed comparably to the custom bilinear interpolation implementation in terms of PSNR, but with shorter execution times due to better algorithmic optimizations.
+
+------
+
+### Conclusion:
+
+1. **Performance**:
+   - Multi-threaded processing significantly reduces execution time for both methods, especially for high-resolution images.
+   - Nearest Neighbor Interpolation is ideal for performance-critical tasks due to its low computational cost, but it compromises image quality.
+2. **Image Quality**:
+   - Bilinear Interpolation offers much better image quality compared to Nearest Neighbor Interpolation, as indicated by higher PSNR values. It is especially recommended for tasks requiring smooth edges and finer details.
+   - OpenCV's `resize` function strikes a balance between execution time and image quality, benefiting from optimized implementations.
 
 ------
 
@@ -105,25 +128,64 @@ To utilize the custom resize function in your project, follow these steps:
 
 ### 3.1. SIMD Optimization with AVX
 
-Leveraging AVX SIMD instructions allows the processing of multiple pixels simultaneously within a single CPU instruction. This data-level parallelism accelerates computationally intensive tasks like interpolation by handling eight pixels at a time.
+By leveraging AVX SIMD instructions, the implementation processes multiple pixels simultaneously in a single CPU instruction. Specifically, it handles **8 pixels at a time**, accelerating operations like nearest neighbor and bilinear interpolation. This data-level parallelism reduces loop iterations and speeds up intensive computations.
 
-### 3.2. Advanced Multi-threading with OpenCV's parallel_for_
+### 3.2. Advanced Multi-threading with OpenMP
 
-By integrating OpenCV's `parallel_for_` with SIMD optimizations, the implementation achieves thread-level parallelism alongside data-level parallelism. This dual approach maximizes performance gains by fully utilizing multi-core CPU architectures.
+Using **OpenMP**, the implementation achieves thread-level parallelism by splitting workload across multiple CPU cores. Combined with SIMD optimization, this dual-level parallelism (thread-level + data-level) fully utilizes multi-core architectures, significantly improving performance for high-resolution images.
 
 ### 3.3. Precomputation of Pixel Mappings
 
-Precomputing the mappings from output pixels to input pixels (`x_mapping` and `y_mapping`) reduces redundant calculations within the resize loops. This optimization minimizes computational overhead and enhances cache performance by accessing precomputed values stored in contiguous memory.
+Precomputing output-to-input pixel mappings (`x_mapping`, `y_mapping`, and interpolation weights like `dx`, `dy`) minimizes redundant calculations during resize operations. These mappings are calculated once and reused, reducing computational overhead and enhancing cache efficiency.
 
-### 3.4. Ensuring Input Matrix Continuity
+### 3.4. Memory Access Optimization
 
-Ensuring that the input matrix is stored contiguously in memory (`input.isContinuous()`) optimizes memory access patterns, leading to faster data retrieval and processing during resizing operations.
+Ensuring the **continuity of the input matrix** (`input.isContinuous()`):
+
+- Optimizes memory access by avoiding scattered memory reads.
+- Copies the matrix into a continuous layout when necessary, enabling faster data retrieval and reducing cache misses.
+
+### 3.5. Optimizations for Nearest Neighbor and Bilinear Interpolation
+
+Both nearest neighbor and bilinear interpolation methods were optimized to achieve high performance while maintaining flexibility for different use cases. The following key techniques were applied:
+
+1. **Multi-threading**:
+   - For both interpolation methods, **OpenMP** is used to distribute workload across multiple threads. Each row of the target image is processed independently, enabling efficient utilization of multi-core CPUs and reducing overall processing time.
+2. **AVX SIMD Vectorization**:
+   - SIMD instructions (AVX) are leveraged to process **8 pixels simultaneously** within a single CPU instruction. This data-level parallelism reduces loop iterations and significantly speeds up pixel-wise computations.
+   - For nearest neighbor, source pixel values are batch-loaded and processed in parallel.
+   - For bilinear interpolation, the formula: $\text{Interpolated Value} = (1 - dx)(1 - dy)I_{11} + dx(1 - dy)I_{21} + (1 - dx)dyI_{12} + dx \cdot dy \cdot I_{22}$ is computed for **8 pixels at a time**, minimizing computational overhead.
+3. **Precomputation of Pixel Mappings and Weights**:
+   - To avoid redundant calculations during resizing loops:
+     - **Nearest Neighbor**: Output-to-input mappings (`x_mapping`, `y_mapping`) are precomputed and stored in reusable arrays.
+     - **Bilinear Interpolation**: Source pixel boundaries (`x1`, `x2`, `y1`, `y2`) and interpolation weights (`dx`, `dy`) are precomputed for each target pixel.
+   - These precomputations reduce loop complexity and enhance cache performance by using contiguous memory.
+4. **Channel-specific Optimizations**:
+   - Separate logic is implemented for single-channel (grayscale) and multi-channel (e.g., RGB) images. This ensures that:
+     - For single-channel images, unnecessary channel-handling overhead is eliminated.
+     - For multi-channel images, `cv::Vec` is used to efficiently process each channel independently while maintaining compatibility with vectorized operations.
+
+### Summary
+
+After using these method, we compare to each other to verify if they could speed up our function.
+
+​           **For Maximum Speed**: Nearest Neighbor methods, particularly **AVX_MT_Multi**, provide the fastest performance due to their simplicity and 			optimized instructions.
+
+​          **For Quality and Speed Balance**: Bilinear methods with AVX and multithreading (e.g., **Bilinear_Custom_AVX_MT_Multi**) offer a good trade-			off, delivering better image quality while keeping processing times reasonable.
+
+​          **OpenCV as a Baseline**: OpenCV remains a reliable choice for interpolation, offering strong performance without requiring extensive custom 			optimization.
 
 ------
 
-### 4. Compare with original resize
+## 4. Performance and Review
 
-#### 1. Our weakness
+### Program Performance
+
+* Our work has achieved **strong performance results** with the custom **multi-threaded implementations of Nearest Neighbor and Bilinear Interpolation**. According to this chart, Especially in Muti-Threaded case, our function only take  **time less than 100ms**. 
+
+* Thanks to multi-threading and AVX2 optimization, our function's execution time does not exhibit exponential growth like single-threaded implementations as the **target image size increases**. Instead, it grows slowly in a linear manner. We have also provided two interpolation methods: **bilinear interpolation** (which offers better image quality) and **nearest neighbor interpolation** (which is faster).
+
+  ###   <center>Our weakness</center>
 
 - **Lacks optimizations**: The custom `resize` implementation is likely to be slower due to the absence of advanced optimizations like multi-threading or SIMD instructions.
 - **No hardware acceleration**: The current solution does not leverage GPU acceleration or other hardware-specific features, leading to potentially higher processing times for large images.
@@ -139,7 +201,7 @@ Ensuring that the input matrix is stored contiguously in memory (`input.isContin
 
 - 
 
-#### 2. **Optimize for Performance**
+### <center>Optimize for Performance</center>
 
 - **Multi-threading**: Implementing multi-threading can significantly improve the performance of the resizing operation, particularly when processing large images.
 - **SIMD Support**: Adding SIMD (Single Instruction, Multiple Data) instructions, such as AVX2 or SSE, would optimize the resizing process by processing multiple pixels in parallel, resulting in faster execution.
@@ -150,7 +212,7 @@ Ensuring that the input matrix is stored contiguously in memory (`input.isContin
 - Improving how edge cases (e.g., very small images, non-square aspect ratios) are handled would enhance the robustness of the custom function.
 - Ensuring that the resized images maintain good visual quality without unexpected artifacts (such as pixelation or blurring) in edge regions would improve the overall user experience.
 
-## 4. Conclusion
+## 5. Conclusion
 
 This project successfully developed a custom image resize function inspired by OpenCV's native `resize` function. By implementing both nearest neighbor and bilinear interpolation methods and enhancing them with multi-threading and SIMD optimizations, the custom resize function achieves high performance and accuracy. The support for multiple data types and multi-channel images broadens its applicability across various computer vision tasks. Comparative analysis demonstrates that while the custom implementation performs admirably, OpenCV's native functions still hold advantages in terms of extensive optimizations and broader feature support. Nonetheless, the custom resize function serves as an excellent educational tool for understanding image processing fundamentals and optimization techniques.
 
