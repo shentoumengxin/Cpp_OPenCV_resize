@@ -1,6 +1,6 @@
 # OpenCV-based Resize Function Implementation and Optimization
 
-**Team Members:** 12311124 Zhang Zihan 12311624 Lin Pinhao 12312210 Liu Ruihan 
+**Team Members:** Zhang Zihan  Lin Pinhao Liu Ruihan 
 
 
 ---
